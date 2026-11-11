@@ -1,0 +1,356 @@
+herename: Build Html To Apk
+on:
+  workflow_dispatch:
+  push:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Create Android project
+        run: |
+          mkdir -p tpl/app/src/main/java/com/hta/app tpl/app/src/main/assets/www
+          cd tpl
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+            repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+            repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'hta'
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.nonTransitiveRClass=true
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+            namespace 'com.hta.app'
+            compileSdk 34
+            defaultConfig {
+              applicationId project.findProperty('appId') ?: 'com.hta.app.zzzzzzzzzzzzzzzz'
+              minSdk 21
+              targetSdk 28
+              versionCode 1
+              versionName '1.0'
+              manifestPlaceholders = [appLabel: project.findProperty('appLabel') ?: 'HTA_APP_NAME_PLACEHOLDER']
+            }
+            compileOptions {
+              sourceCompatibility JavaVersion.VERSION_17
+              targetCompatibility JavaVersion.VERSION_17
+            }
+            lint { abortOnError false; checkReleaseBuilds false }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+            <application android:label="${appLabel}" android:icon="@mipmap/ic_launcher" android:allowBackup="false" android:usesCleartextTraffic="true">
+              <activity android:name=".MainActivity" android:exported="true" android:windowSoftInputMode="adjustResize" android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout|keyboard|uiMode">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+              <provider android:name=".FileProv" android:authorities="${applicationId}.files" android:exported="false" android:grantUriPermissions="true"/>
+            </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/hta/app/FileProv.java <<'EOF'
+          package com.hta.app;
+          import android.content.ContentProvider;
+          import android.content.ContentValues;
+          import android.database.Cursor;
+          import android.database.MatrixCursor;
+          import android.net.Uri;
+          import android.os.ParcelFileDescriptor;
+          import android.provider.OpenableColumns;
+          import java.io.File;
+          import java.io.FileNotFoundException;
+          public class FileProv extends ContentProvider {
+            private File f(Uri u) { return new File(new File(getContext().getCacheDir(), "apks"), u.getLastPathSegment()); }
+            public boolean onCreate() { return true; }
+            public ParcelFileDescriptor openFile(Uri u, String m) throws FileNotFoundException {
+              return ParcelFileDescriptor.open(f(u), ParcelFileDescriptor.MODE_READ_ONLY);
+            }
+            public Cursor query(Uri u, String[] p, String s, String[] a, String o) {
+              File x = f(u);
+              MatrixCursor c = new MatrixCursor(new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE});
+              c.addRow(new Object[]{x.getName(), x.length()});
+              return c;
+            }
+            public String getType(Uri u) { return "application/vnd.android.package-archive"; }
+            public Uri insert(Uri u, ContentValues v) { return null; }
+            public int delete(Uri u, String s, String[] a) { return 0; }
+            public int update(Uri u, ContentValues v, String s, String[] a) { return 0; }
+          }
+          EOF
+          cat > app/src/main/java/com/hta/app/MainActivity.java <<'EOF'
+          package com.hta.app;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.pm.ApplicationInfo;
+          import android.content.pm.PackageInfo;
+          import android.content.pm.PackageManager;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.drawable.Drawable;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.RandomAccessFile;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.List;
+
+          public class MainActivity extends Activity {
+            WebView wv;
+            ValueCallback<Uri[]> cb;
+
+            @Override
+            protected void onCreate(Bundle b) {
+              super.onCreate(b);
+              wv = new WebView(this);
+              setContentView(wv);
+              WebSettings s = wv.getSettings();
+              s.setJavaScriptEnabled(true);
+              s.setDomStorageEnabled(true);
+              s.setAllowFileAccess(true);
+              wv.addJavascriptInterface(new Bridge(), "HtaBridge");
+              wv.setWebViewClient(new WebViewClient());
+              wv.setWebChromeClient(new WebChromeClient() {
+                @Override
+                public boolean onShowFileChooser(WebView w, ValueCallback<Uri[]> c, FileChooserParams p) {
+                  if (cb != null) cb.onReceiveValue(null);
+                  cb = c;
+                  Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                  i.addCategory(Intent.CATEGORY_OPENABLE);
+                  String t = "*/*";
+                  String[] ac = p.getAcceptTypes();
+                  if (ac != null && ac.length > 0 && ac[0] != null && ac[0].length() > 0) t = ac[0];
+                  i.setType(t);
+                  i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                  try { startActivityForResult(i, 1); } catch (Exception e) { cb = null; return false; }
+                  return true;
+                }
+              });
+              wv.loadUrl("file:///android_asset/www/index.html");
+            }
+
+            @Override
+            protected void onActivityResult(int rq, int rs, Intent d) {
+              if (rq == 1 && cb != null) {
+                Uri[] r = null;
+                if (rs == RESULT_OK && d != null) {
+                  if (d.getClipData() != null) {
+                    int n = d.getClipData().getItemCount();
+                    r = new Uri[n];
+                    for (int i = 0; i < n; i++) r[i] = d.getClipData().getItemAt(i).getUri();
+                  } else if (d.getData() != null) {
+                    r = new Uri[]{d.getData()};
+                  }
+                }
+                cb.onReceiveValue(r);
+                cb = null;
+              }
+            }
+
+            class Bridge {
+              FileOutputStream os;
+
+              String icon(Drawable d, int s) {
+                Bitmap bm = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888);
+                Canvas c = new Canvas(bm);
+                d.setBounds(0, 0, s, s);
+                d.draw(c);
+                ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                bm.compress(Bitmap.CompressFormat.PNG, 100, bo);
+                return Base64.encodeToString(bo.toByteArray(), Base64.NO_WRAP);
+              }
+
+              File apk(String pkg) throws Exception {
+                return new File(getPackageManager().getApplicationInfo(pkg, 0).sourceDir);
+              }
+
+              @JavascriptInterface
+              public String listApps() {
+                try {
+                  PackageManager pm = getPackageManager();
+                  List<JSONObject> items = new ArrayList<JSONObject>();
+                  for (ApplicationInfo ai : pm.getInstalledApplications(0)) {
+                    if (pm.getLaunchIntentForPackage(ai.packageName) == null) continue;
+                    if (ai.packageName.equals(getPackageName())) continue;
+                    JSONObject o = new JSONObject();
+                    o.put("n", pm.getApplicationLabel(ai).toString());
+                    o.put("p", ai.packageName);
+                    o.put("i", icon(pm.getApplicationIcon(ai), 96));
+                    items.add(o);
+                  }
+                  Collections.sort(items, new Comparator<JSONObject>() {
+                    public int compare(JSONObject a, JSONObject b) {
+                      return a.optString("n").toLowerCase().compareTo(b.optString("n").toLowerCase());
+                    }
+                  });
+                  JSONArray arr = new JSONArray();
+                  for (JSONObject o : items) arr.put(o);
+                  return arr.toString();
+                } catch (Exception e) { return "[]"; }
+              }
+
+              @JavascriptInterface
+              public String appInfo(String pkg) {
+                try {
+                  PackageManager pm = getPackageManager();
+                  ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                  PackageInfo pi = pm.getPackageInfo(pkg, 0);
+                  JSONObject o = new JSONObject();
+                  o.put("p", pkg);
+                  o.put("n", pm.getApplicationLabel(ai).toString());
+                  o.put("v", pi.versionName == null ? "1.0" : pi.versionName);
+                  o.put("i", icon(pm.getApplicationIcon(ai), 192));
+                  o.put("z", new File(ai.sourceDir).length());
+                  o.put("s", ai.splitSourceDirs == null ? 0 : ai.splitSourceDirs.length);
+                  return o.toString();
+                } catch (Exception e) { return "{}"; }
+              }
+
+              @JavascriptInterface
+              public String apkSize(String pkg) {
+                try { return String.valueOf(apk(pkg).length()); } catch (Exception e) { return "0"; }
+              }
+
+              @JavascriptInterface
+              public String apkChunk(String pkg, String offset) {
+                try {
+                  File f = apk(pkg);
+                  long off = Long.parseLong(offset);
+                  if (off >= f.length()) return "";
+                  int len = (int) Math.min(262144L, f.length() - off);
+                  byte[] buf = new byte[len];
+                  RandomAccessFile r = new RandomAccessFile(f, "r");
+                  r.seek(off);
+                  r.readFully(buf);
+                  r.close();
+                  return Base64.encodeToString(buf, Base64.NO_WRAP);
+                } catch (Exception e) { return ""; }
+              }
+
+              @JavascriptInterface
+              public String sdk() { return String.valueOf(Build.VERSION.SDK_INT); }
+
+              @JavascriptInterface
+              public String begin(String fn) {
+                try {
+                  if (os != null) os.close();
+                  File d = new File(getCacheDir(), "apks");
+                  d.mkdirs();
+                  os = new FileOutputStream(new File(d, "install.apk"));
+                  return "ok";
+                } catch (Exception e) { return "error: " + e.getMessage(); }
+              }
+
+              @JavascriptInterface
+              public String chunk(String b64) {
+                try { os.write(Base64.decode(b64, Base64.DEFAULT)); return "ok"; }
+                catch (Exception e) { return "error: " + e.getMessage(); }
+              }
+
+              @JavascriptInterface
+              public String finish(boolean install) {
+                try {
+                  os.close();
+                  os = null;
+                  if (install) {
+                    Uri u = Uri.parse("content://" + getPackageName() + ".files/install.apk");
+                    Intent i = new Intent(Intent.ACTION_VIEW);
+                    i.setDataAndType(u, "application/vnd.android.package-archive");
+                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(i);
+                  }
+                  return "ok:install.apk";
+                } catch (Exception e) { return "error: " + e.getMessage(); }
+              }
+            }
+          }
+          EOF
+          python3 - <<'PY'
+          import zlib, struct, os
+          def png(n, path):
+              raw = b''.join(b'\x00' + bytes((47, 109, 246)) * n for _ in range(n))
+              def ch(t, d):
+                  return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+              data = b'\x89PNG\r\n\x1a\n' + ch(b'IHDR', struct.pack('>IIBBBBB', n, n, 8, 2, 0, 0, 0)) + ch(b'IDAT', zlib.compress(raw)) + ch(b'IEND', b'')
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              open(path, 'wb').write(data)
+          for d, n in [('mdpi', 48), ('hdpi', 72), ('xhdpi', 96), ('xxhdpi', 144), ('xxxhdpi', 192)]:
+              png(n, 'app/src/main/res/mipmap-%s/ic_launcher.png' % d)
+          PY
+          cp ../index.html app/src/main/assets/www/index.html
+
+      - name: Build template APK
+        run: gradle -p tpl assembleDebug
+
+      - name: Check template
+        run: |
+          python3 - <<'PY'
+          import zipfile
+          z = zipfile.ZipFile('tpl/app/build/outputs/apk/debug/app-debug.apk')
+          PH = 'com.hta.app.zzzzzzzzzzzzzzzz'
+          LB = 'HTA_APP_NAME_PLACEHOLDER'
+          arsc = z.read('resources.arsc')
+          man = z.read('AndroidManifest.xml')
+          has = lambda b, s: s.encode() in b or s.encode('utf-16le') in b
+          assert PH.encode('utf-16le') in arsc, 'package placeholder missing in resources.arsc'
+          assert has(man, PH) and has(man, LB), 'placeholders missing in manifest'
+          print([n for n in z.namelist() if 'ic_launcher' in n])
+          PY
+
+      - name: Embed template into index.html and build final app
+        run: |
+          python3 - <<'PY'
+          import base64, re
+          b = base64.b64encode(open('tpl/app/build/outputs/apk/debug/app-debug.apk', 'rb').read()).decode()
+          s = open('index.html', encoding='utf-8').read()
+          s2, n = re.subn(r'const TPL_B64="[^"]*";', lambda m: 'const TPL_B64="' + b + '";', s)
+          assert n == 1, 'TPL_B64 not found in index.html'
+          open('tpl/app/src/main/assets/www/index.html', 'w', encoding='utf-8').write(s2)
+          PY
+          gradle -p tpl assembleDebug -PappId=com.htmltoapk.app "-PappLabel=Html To Apk"
+          cp tpl/app/build/outputs/apk/debug/app-debug.apk Html-To-Apk.apk
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: Html-To-Apk.apk
