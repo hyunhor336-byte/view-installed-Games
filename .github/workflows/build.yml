@@ -1,4 +1,4 @@
-herename: Build Html To Apk
+name: Build Html To Apk
 on:
   workflow_dispatch:
   push:
